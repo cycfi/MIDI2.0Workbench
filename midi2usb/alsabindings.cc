@@ -3,12 +3,58 @@
 #include <iostream>
 #include <alsa/asoundlib.h>
 #include <errno.h>
+#include <cstring>
 
 static snd_seq_t *seq;
 snd_seq_client_info_t *cinfo;
 snd_seq_port_info_t *pinfo;
 snd_ctl_card_info_t* card_info;
 int localPort;
+
+// The port sendUMP addresses for an endpoint whose input is not its own port.
+static std::map<int, snd_seq_addr_t> inputs;
+
+// A software UMP endpoint, a user client's readable port with the UMP
+// endpoint capability, may take its input on a writable port of a second
+// client of the same process (libremidi opens one client per direction).
+// Finds that input: the port itself if writable, else a writable port of
+// the same name in another UMP client with the same pid.
+static bool findSoftwareInput(snd_seq_client_info_t* ci, snd_seq_port_info_t* pi,
+    snd_seq_addr_t& addr) {
+    unsigned int caps = snd_seq_port_info_get_capability(pi);
+    if (snd_seq_client_info_get_type(ci) != SND_SEQ_USER_CLIENT
+        || (caps & SND_SEQ_PORT_CAP_UMP_ENDPOINT) == 0
+        || (caps & SND_SEQ_PORT_CAP_READ) == 0)
+        return false;
+    if (caps & SND_SEQ_PORT_CAP_WRITE) {
+        addr = *snd_seq_port_info_get_addr(pi);
+        return true;
+    }
+    int client = snd_seq_client_info_get_client(ci);
+    int pid = snd_seq_client_info_get_pid(ci);
+    const char* name = snd_seq_port_info_get_name(pi);
+    snd_seq_client_info_t* c;
+    snd_seq_port_info_t* p;
+    snd_seq_client_info_alloca(&c);
+    snd_seq_port_info_alloca(&p);
+    snd_seq_client_info_set_client(c, -1);
+    while (snd_seq_query_next_client(seq, c) >= 0) {
+        int other = snd_seq_client_info_get_client(c);
+        if (other == client || snd_seq_client_info_get_pid(c) != pid
+            || snd_seq_client_info_get_midi_version(c) == SND_SEQ_CLIENT_LEGACY_MIDI)
+            continue;
+        snd_seq_port_info_set_client(p, other);
+        snd_seq_port_info_set_port(p, -1);
+        while (snd_seq_query_next_port(seq, p) >= 0) {
+            if ((snd_seq_port_info_get_capability(p) & SND_SEQ_PORT_CAP_WRITE)
+                && !strcmp(snd_seq_port_info_get_name(p), name)) {
+                addr = *snd_seq_port_info_get_addr(p);
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 
 
@@ -156,6 +202,7 @@ NAN_METHOD(get_UMP_Endpoints) {
 
 #ifdef __ALSA_UMP_H
     uint8_t epFound=0;
+    inputs.clear();
 
     snd_seq_client_info_set_client(cinfo, -1);
     while (snd_seq_query_next_client(seq, cinfo) >= 0) {
@@ -174,11 +221,20 @@ NAN_METHOD(get_UMP_Endpoints) {
 
         uint16_t portTypeInfo = snd_seq_port_info_get_type(pinfo);
 
+        snd_seq_addr_t input;
+        bool software = findSoftwareInput(cinfo, pinfo, input);
 
-        if ((portTypeInfo &
+        if (!software && ((portTypeInfo &
             (SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION)
-            ) || (portTypeInfo & SND_SEQ_PORT_TYPE_MIDI_UMP)==0)
+            ) || (portTypeInfo & SND_SEQ_PORT_TYPE_MIDI_UMP)==0))
           continue;
+        // A software endpoint goes by its port name: libremidi gives every
+        // client the same generic name.
+        const char * epName = clientName;
+        if (software) {
+          inputs[client] = input;
+          epName = snd_seq_port_info_get_name(pinfo);
+        }
               
         std::cout << "Port "
              << portTypeInfo
@@ -187,7 +243,7 @@ NAN_METHOD(get_UMP_Endpoints) {
              << snd_seq_port_info_get_port(pinfo)
              << ' '
              //<< snd_seq_client_info_get_name(cinfo)
-             << clientName
+             << epName
              << " > "
              << snd_seq_port_info_get_name(pinfo)
             <<  '\n';
@@ -221,7 +277,7 @@ NAN_METHOD(get_UMP_Endpoints) {
         Nan::Set(port,Nan::New("client").ToLocalChecked(),Nan::New(client));
         Nan::Set(port,Nan::New("port").ToLocalChecked(),Nan::New(portNum));
         
-        Nan::Set(port,Nan::New("clientName").ToLocalChecked(), Nan::New(clientName).ToLocalChecked());
+        Nan::Set(port,Nan::New("clientName").ToLocalChecked(), Nan::New(epName).ToLocalChecked());
 
         Nan::Set(port,Nan::New("name").ToLocalChecked(), Nan::New(snd_ump_endpoint_info_get_name(ep)).ToLocalChecked());
         Nan::Set(port,Nan::New("productId").ToLocalChecked(), Nan::New(snd_ump_endpoint_info_get_product_id(ep)).ToLocalChecked());
@@ -378,7 +434,11 @@ NAN_METHOD(sendUMP){
 #endif
     snd_seq_ev_set_direct(&ev);
     snd_seq_ev_set_source(&ev, localPort );
-    snd_seq_ev_set_dest(&ev, client, 0);
+    auto input = inputs.find(client);
+    if (input != inputs.end())
+        snd_seq_ev_set_dest(&ev, input->second.client, input->second.port);
+    else
+        snd_seq_ev_set_dest(&ev, client, 0);
 
     v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
     v8::Local<v8::Array> jsArray = v8::Local<v8::Array>::Cast(info[1]);
