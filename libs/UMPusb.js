@@ -175,7 +175,10 @@ if(os.platform()==='win32'){
 
 
     try {
-        if (execSync("midi service status", {encoding: "utf8"}).match(/Service MidiSrv is running/).length) {
+        // The console says "State  Running" now, and the service starts on demand,
+        // so ping it first and accept either wording.
+        const status = execSync("midi service ping && midi service status", {encoding: "utf8"});
+        if (/Service MidiSrv is running|State\s+Running/.test(status)) {
             //Window MIDI Service is running
 
             child = spawn( exePath );
